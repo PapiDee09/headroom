@@ -5255,12 +5255,92 @@ class OpenAIHandlerMixin:
                 _thinking = ThinkingTokens()
                 total_latency = (time.time() - start_time) * 1000
 
+                # ── CCR retrieval resolution (direct chat path) ──────────
+                # Every other path answers a `headroom_retrieve` call:
+                # gateway_turn.py, the Gemini and Anthropic handlers, the custom
+                # backend branch above, and Responses. This branch did not, so a
+                # tool the proxy itself injects (`ccr_inject_tool` defaults True)
+                # reached the client as a `tool_calls` entry for a function it
+                # never declared and cannot implement — stalling any agent loop
+                # driven off `finish_reason`.
+                #
+                # The continuation is a real, billed upstream call, so it is
+                # recorded into `_hook_usage` exactly like a turn-hook re-drive:
+                # `settle(final)` drops the one response the usage block below
+                # reads and totals the rest. Counting only the last call would
+                # let retrieval hide its own cost, which is the mistake the
+                # matching comment on the re-drive block below warns about.
+                _ccr_final_json: dict[str, Any] | None = None
+                if self.ccr_response_handler is not None and response.status_code == 200:
+                    try:
+                        _pre_ccr_json = response.json()
+                    except Exception:  # pragma: no cover - non-JSON upstream
+                        _pre_ccr_json = None
+                    if _pre_ccr_json and self.ccr_response_handler.has_ccr_tool_calls(
+                        _pre_ccr_json, "openai"
+                    ):
+                        logger.info(
+                            f"[{request_id}] CCR: retrieval tool call on the direct "
+                            "chat path, resolving before replying"
+                        )
+
+                        async def _ccr_api_call_fn(
+                            msgs: list[dict[str, Any]],
+                            tls: list[dict[str, Any]] | None,
+                        ) -> dict[str, Any]:
+                            continuation_body = {**body, "messages": msgs}
+                            if tls is not None:
+                                continuation_body["tools"] = tls
+                            # A continuation is always non-streaming, whatever
+                            # the client asked for.
+                            continuation_body.pop("stream", None)
+                            continuation_headers = {
+                                k: v
+                                for k, v in headers.items()
+                                if k.lower()
+                                not in (
+                                    "accept",
+                                    "content-type",
+                                    "content-length",
+                                    "content-encoding",
+                                )
+                            }
+                            continuation_headers["content-type"] = "application/json"
+                            continuation_headers["accept"] = "application/json"
+                            cont = await self._retry_request(
+                                "POST", url, continuation_headers, continuation_body
+                            )
+                            cont_json: dict[str, Any] = cont.json()
+                            _hook_usage.record(cont_json, **CHAT_USAGE_KEYS)
+                            return cont_json
+
+                        try:
+                            _hook_usage.record(_pre_ccr_json, **CHAT_USAGE_KEYS)
+                            _ccr_final_json = await self.ccr_response_handler.handle_response(
+                                _pre_ccr_json,
+                                optimized_messages,
+                                tools,
+                                _ccr_api_call_fn,
+                                provider="openai",
+                            )
+                            _hook_usage.settle(_ccr_final_json)
+                        except Exception as ccr_err:
+                            # Fail open to the model's own reply rather than 502 a
+                            # turn the client could still act on.
+                            logger.warning(
+                                f"[{request_id}] CCR: direct-path resolution failed "
+                                f"({type(ccr_err).__name__}: {ccr_err}); forwarding "
+                                "the upstream reply unchanged"
+                            )
+                            _ccr_final_json = None
+                            _hook_usage.settle(_pre_ccr_json)
+
                 total_input_tokens = optimized_tokens  # fallback
                 output_tokens = 0
                 cache_read_tokens = 0
                 resp_json = None
                 try:
-                    resp_json = response.json()
+                    resp_json = _ccr_final_json if _ccr_final_json is not None else response.json()
                     usage = resp_json.get("usage", {})
                     # Coerce present-but-null counts: the arithmetic below
                     # (`_infer_openai_cache_write_tokens`, `max(...)`) runs
@@ -5495,7 +5575,11 @@ class OpenAIHandlerMixin:
                     )
 
                 return Response(
-                    content=response.content,
+                    content=(
+                        json.dumps(_ccr_final_json).encode()
+                        if _ccr_final_json is not None
+                        else response.content
+                    ),
                     status_code=response.status_code,
                     headers=response_headers,
                 )
