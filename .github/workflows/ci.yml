@@ -665,3 +665,5 @@ jobs:
           BASH_PREFIX="$(brew --prefix bash)"
           export PATH="$BASH_PREFIX/bin:$PATH"
           pytest tests/test_install/test_native_installers.py -q
+
+# Workflow registration refresh: 2026-09-30
